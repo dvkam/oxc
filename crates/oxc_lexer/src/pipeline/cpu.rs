@@ -40,8 +40,6 @@
 //!
 //! DO NOT add any other way to create these types (e.g. a `Default` impl or a public constructor).
 
-#![expect(unused)]
-
 /// Trait for types representing a CPU feature set.
 ///
 /// Implemented by all types representing specific CPU feature sets, and by [`DynCpu`].
@@ -517,6 +515,7 @@ pub(super) use cpu_select;
 ///     }
 /// }
 /// ```
+#[expect(unused_macros)]
 macro_rules! cpu_versions {
     // `#[inline]` attributes go on the entry points, and all other attributes go on the outer function.
     // Attributes are captured as raw tokens, so `inline` can be matched. They're sorted one at a time
@@ -652,7 +651,9 @@ macro_rules! cpu_versions {
     };
 }
 
+#[expect(unused_imports)]
 pub(super) use cpu_versions;
 
 /// Re-exported so call sites can import it from here, along with [`cpu_versions!`].
+#[expect(unused_imports)]
 pub(super) use macro_rules_attr::apply;
