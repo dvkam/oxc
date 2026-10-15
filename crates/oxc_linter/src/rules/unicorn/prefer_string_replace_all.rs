@@ -1,16 +1,24 @@
+use rustc_hash::FxHashMap;
+
 use oxc_ast::{
     AstKind,
-    ast::{Argument, MemberExpression, RegExpFlags},
+    ast::{Argument, Expression, MemberExpression, RegExpFlags},
 };
 use oxc_codegen::CodegenOptions;
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_regular_expression::ast::Term;
+use oxc_semantic::SymbolId;
 use oxc_span::{GetSpan, Span};
 use oxc_str::CompactStr;
 
 use crate::{
-    AstNode, ast_util::extract_regex_flags, context::LintContext, fixer::RuleFixer, rule::Rule,
+    AstNode,
+    ast_util::{extract_regex_flags, iter_outer_expressions},
+    context::LintContext,
+    fixer::RuleFixer,
+    rule::Rule,
+    utils::is_regexp_callee,
 };
 
 fn string_literal(span: Span, replacement: &str) -> OxcDiagnostic {
@@ -61,7 +69,20 @@ declare_oxc_lint!(
 );
 
 impl Rule for PreferStringReplaceAll {
-    fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
+    fn run_once(&self, ctx: &LintContext) {
+        let mut resolved_patterns = FxHashMap::default();
+        for node in ctx.nodes().iter() {
+            Self::check(node, ctx, &mut resolved_patterns);
+        }
+    }
+}
+
+impl PreferStringReplaceAll {
+    fn check<'a>(
+        node: &AstNode<'a>,
+        ctx: &LintContext<'a>,
+        resolved_patterns: &mut FxHashMap<SymbolId, bool>,
+    ) {
         let AstKind::CallExpression(call_expr) = node.kind() else {
             return;
         };
@@ -94,7 +115,7 @@ impl Rule for PreferStringReplaceAll {
                     });
                 }
             }
-            "replace" if is_reg_exp_with_global_flag(pattern) => {
+            "replace" if is_reg_exp_with_global_flag(pattern, ctx, resolved_patterns) => {
                 let diagnostic = use_replace_all(static_member_expr.property.span);
 
                 if let Some(k) = get_pattern_replacement(pattern) {
@@ -125,22 +146,84 @@ fn generate_string_literal(fixer: RuleFixer<'_, '_>, value: &str) -> String {
     codegen.into_source_text()
 }
 
-fn is_reg_exp_with_global_flag<'a>(expr: &'a Argument<'a>) -> bool {
-    if let Argument::RegExpLiteral(reg_exp_literal) = expr {
-        return reg_exp_literal.regex.flags.contains(RegExpFlags::G);
-    }
+fn is_reg_exp_with_global_flag<'a>(
+    expr: &'a Argument<'a>,
+    ctx: &LintContext<'a>,
+    resolved_patterns: &mut FxHashMap<SymbolId, bool>,
+) -> bool {
+    let Some(mut expr) = expr.as_expression() else {
+        return false;
+    };
+    let mut resolved_symbols = smallvec::SmallVec::<[_; 4]>::new();
 
-    if let Argument::NewExpression(new_expr) = expr {
-        if !new_expr.callee.is_specific_id("RegExp") {
-            return false;
+    let result = loop {
+        match expr.get_inner_expression() {
+            Expression::Identifier(ident) => {
+                let Some(symbol_id) = ctx.scoping().get_reference(ident.reference_id()).symbol_id()
+                else {
+                    break false;
+                };
+                if let Some(&result) = resolved_patterns.get(&symbol_id) {
+                    break result;
+                }
+                resolved_patterns.insert(symbol_id, false);
+                resolved_symbols.push(symbol_id);
+                let declaration = ctx.nodes().get_node(ctx.scoping().symbol_declaration(symbol_id));
+                let AstKind::VariableDeclarator(declarator) = declaration.kind() else {
+                    break false;
+                };
+                if !declarator.id.is_binding_identifier()
+                    || !ctx.scoping().symbol_redeclarations(symbol_id).is_empty()
+                {
+                    break false;
+                }
+                let Some(init) = &declarator.init else {
+                    break false;
+                };
+                if ctx.scoping().get_resolved_references(symbol_id).any(|reference| {
+                    let reference_span = ctx.nodes().get_node(reference.node_id()).span();
+                    reference.is_write()
+                        || iter_outer_expressions(ctx.nodes(), reference.node_id())
+                            .find(|kind| match kind {
+                                AstKind::StaticMemberExpression(member) => {
+                                    !member.object.span().contains_inclusive(reference_span)
+                                }
+                                AstKind::ComputedMemberExpression(member) => {
+                                    !member.object.span().contains_inclusive(reference_span)
+                                }
+                                AstKind::PrivateFieldExpression(member) => {
+                                    !member.object.span().contains_inclusive(reference_span)
+                                }
+                                _ => true,
+                            })
+                            .is_some_and(|kind| match kind {
+                                AstKind::AssignmentExpression(assignment) => {
+                                    assignment.left.span().contains_inclusive(reference_span)
+                                }
+                                AstKind::UpdateExpression(_) => true,
+                                _ => false,
+                            })
+                }) {
+                    break false;
+                }
+                expr = init;
+            }
+            Expression::RegExpLiteral(reg_exp_literal) => {
+                break reg_exp_literal.regex.flags.contains(RegExpFlags::G);
+            }
+            Expression::NewExpression(new_expr) => {
+                break is_regexp_callee(&new_expr.callee, ctx)
+                    && !matches!(new_expr.arguments.first(), Some(Argument::SpreadElement(_)))
+                    && extract_regex_flags(&new_expr.arguments)
+                        .is_some_and(|flags| flags.contains(RegExpFlags::G));
+            }
+            _ => break false,
         }
-
-        if let Some(flags) = extract_regex_flags(&new_expr.arguments) {
-            return flags.contains(RegExpFlags::G);
-        }
+    };
+    for symbol_id in resolved_symbols {
+        resolved_patterns.insert(symbol_id, result);
     }
-
-    false
+    result
 }
 
 fn get_pattern_replacement<'a>(expr: &'a Argument<'a>) -> Option<CompactStr> {
@@ -229,6 +312,19 @@ fn test() {
         r"foo.replaceAll(/foo/gm, bar)",
         r"foo.replaceAll(/foo/gs, bar)",
         r"foo.replaceAll(/foo/gim, bar)",
+        r"const pattern = /a/; foo.replace(pattern, bar)",
+        r"let pattern = /a/g; pattern = /a/; foo.replace(pattern, bar)",
+        r"const pattern = /a/g; foo.replaceAll(pattern, bar)",
+        r"const pattern = /a/g; function f(pattern) { foo.replace(pattern, bar); }",
+        r"const a = b; const b = a; foo.replace(a, bar)",
+        r"const {pattern} = /a/g; foo.replace(pattern, bar)",
+        r#"function f(RegExp) { const pattern = new RegExp("foo", "g"); foo.replace(pattern, bar); }"#,
+        r"let pattern = /a/g; const alias = pattern; pattern = /a/; foo.replace(alias, bar)",
+        r#"var RE = /a/g; var RE = /b/; "aba".replace(RE, "x")"#,
+        r#"const RE = /a/g; RE[Symbol.replace] = undefined; "x/a/gx/a/g".replace(RE, "b")"#,
+        r"const RE = /a/g; RE.lastIndex++; foo.replace(RE, bar)",
+        r"const RE = /a/g; const alias = RE; RE[Symbol.replace] = undefined; foo.replace(alias, bar)",
+        r#"const RE = new RegExp(...patterns, "g"); foo.replace(RE, bar)"#,
     ];
 
     let fail = vec![
@@ -252,7 +348,6 @@ fn test() {
         r"foo.replace(/a/gui, bar)",
         r"foo.replace(/a/uig, bar)",
         r"foo.replace(/a/vig, bar)",
-        // r#"const pattern = new RegExp("foo", "g"); foo.replace(pattern, bar)"#,
         r#"foo.replace(new RegExp("foo", "g"), bar)"#,
         r"foo.replace(/a]/g, _)",
         r"foo.replace(/[a]/g, _)",
@@ -281,6 +376,15 @@ fn test() {
         // u/v flags are allowed, so replaceAll should still suggest string replacement
         r"foo.replaceAll(/foo/gu, bar)",
         r"foo.replaceAll(/foo/gv, bar)",
+        r#"const RE = /a/g;
+export const out = s.replace(RE, "b");
+export const out2 = s.replace(/a/g, "b");"#,
+        r#"const pattern = new RegExp("foo", "g"); foo.replace(pattern, bar)"#,
+        r"let pattern = /a/g; foo.replace(pattern, bar)",
+        r"var pattern = /a/g; foo.replace(pattern, bar)",
+        r"const pattern = (/a/g); foo.replace((pattern), bar)",
+        r"const pattern = /a/g; const alias = pattern; foo.replace(alias, bar)",
+        r"const pattern = /a/g; obj[pattern] = value; foo.replace(pattern, bar)",
     ];
 
     let fix = vec![
@@ -410,10 +514,18 @@ fn test() {
         //     r"foo.replaceAll(/a/gms, bar)",
         //     r"foo.replaceAll('a', bar)",
         // ),
-        // (
-        //     r#"const pattern = new RegExp("foo", "g"); foo.replace(pattern, bar)"#,
-        //     r#"const pattern = new RegExp("foo", "g"); foo.replaceAll(pattern, bar)"#,
-        // ),
+        (
+            r#"const pattern = new RegExp("foo", "g"); foo.replace(pattern, bar)"#,
+            r#"const pattern = new RegExp("foo", "g"); foo.replaceAll(pattern, bar)"#,
+        ),
+        (
+            r"const pattern = /a/g; foo.replace(pattern, bar)",
+            r"const pattern = /a/g; foo.replaceAll(pattern, bar)",
+        ),
+        (
+            r"const pattern = /a/g; const alias = pattern; foo.replace(alias, bar)",
+            r"const pattern = /a/g; const alias = pattern; foo.replaceAll(alias, bar)",
+        ),
         // (
         //     r"foo.replace(/a{1}/g, _)",
         //     r"foo.replaceAll('a', _)",
