@@ -1,11 +1,13 @@
+use std::borrow::Cow;
+
 use itertools::Itertools;
 use oxc_allocator::{Allocator, BitSet, CloneIn};
 use smallvec::SmallVec;
 
 use oxc_ast::{
-    AstKind,
+    AstKind, AstType,
     ast::{
-        AssignmentTarget as AstAssignmentTarget, BindingPattern, Expression,
+        AssignmentTarget as AstAssignmentTarget, BindingPattern, ClassElement, Expression,
         VariableDeclarationKind, VariableDeclarator,
     },
 };
@@ -22,6 +24,7 @@ use oxc_macros::declare_oxc_lint;
 use oxc_semantic::{NodeId, Reference, ScopeId, SymbolId};
 use oxc_span::GetSpan;
 use oxc_span::Span;
+use oxc_syntax::operator::LogicalOperator;
 
 use crate::{context::LintContext, rule::Rule};
 
@@ -214,6 +217,18 @@ impl Rule for NoUselessAssignment {
             let mut ambiguous_assignment_index = 0;
 
             for reference in ctx.symbol_references(symbol_id) {
+                if tracked_symbols[compact_idx as usize].has_captured_read {
+                    break;
+                }
+                if Self::is_captured_by_field_initializer(ctx, decl_node.id(), reference.node_id())
+                {
+                    if reference.is_read() {
+                        tracked_symbols[compact_idx as usize].is_used = true;
+                        tracked_symbols[compact_idx as usize].has_captured_read = true;
+                    }
+                    continue;
+                }
+
                 let mut is_within_pending_assignment = false;
                 if let Some((lhs, previous_value_read)) = pending_assignment_lhs
                     && let Some(assign_node_id) = Self::get_assignment_node(ctx, lhs)
@@ -355,6 +370,9 @@ impl Rule for NoUselessAssignment {
         if num_tracked == 0 {
             return;
         }
+
+        let refined_graph = Self::refine_short_circuit_conditions(ctx);
+        let graph = refined_graph.as_ref();
 
         let mut cfg_traverse_state: CfgTraverseState<'_> =
             CfgTraverseState::with_capacity(num_blocks);
@@ -508,6 +526,135 @@ impl Rule for NoUselessAssignment {
 }
 
 impl NoUselessAssignment {
+    fn is_captured_by_field_initializer(
+        ctx: &LintContext,
+        declaration: NodeId,
+        reference: NodeId,
+    ) -> bool {
+        if !ctx.nodes().contains(AstType::PropertyDefinition)
+            || ctx.nodes().get_node(declaration).scope_id()
+                == ctx.nodes().get_node(reference).scope_id()
+        {
+            return false;
+        }
+        let declaration_span = ctx.nodes().get_node(declaration).span();
+        let reference_span = ctx.nodes().get_node(reference).span();
+        for scope_id in ctx.scoping().scope_ancestors(ctx.nodes().get_node(reference).scope_id()) {
+            if ctx.scoping().scope_flags(scope_id).is_var() {
+                break;
+            }
+            let AstKind::Class(class) =
+                ctx.nodes().get_node(ctx.scoping().get_node_id(scope_id)).kind()
+            else {
+                continue;
+            };
+            let index = class
+                .body
+                .body
+                .partition_point(|element| element.span().end <= reference_span.start);
+            if let Some(ClassElement::PropertyDefinition(property)) = class.body.body.get(index)
+                && property.value.as_ref().is_some_and(|value| {
+                    value.span().contains_inclusive(reference_span)
+                        && !value.span().contains_inclusive(declaration_span)
+                })
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn refine_short_circuit_conditions<'a>(ctx: &'a LintContext) -> Cow<'a, Graph> {
+        let graph = ctx.cfg().graph();
+        if !ctx.nodes().contains(AstType::LogicalExpression) {
+            return Cow::Borrowed(graph);
+        }
+        let mut redirects = Vec::new();
+        for node in ctx.nodes() {
+            let (test, consequent) = match node.kind() {
+                AstKind::WhileStatement(stmt) => (&stmt.test, stmt.body.node_id()),
+                AstKind::ForStatement(stmt) => {
+                    let Some(test) = &stmt.test else { continue };
+                    (test, stmt.body.node_id())
+                }
+                AstKind::IfStatement(stmt) => (&stmt.test, stmt.consequent.node_id()),
+                AstKind::ConditionalExpression(expr) => (&expr.test, expr.consequent.node_id()),
+                _ => continue,
+            };
+            if !matches!(test.without_parentheses(), Expression::LogicalExpression(_)) {
+                continue;
+            }
+            let truthy = ctx.nodes().cfg_id(consequent);
+            let Some(branch) = graph
+                .edges_directed(truthy, Direction::Incoming)
+                .find(|edge| matches!(edge.weight(), EdgeType::Jump))
+            else {
+                continue;
+            };
+            let Some(falsy) =
+                graph.edges_directed(branch.source(), Direction::Outgoing).find_map(|edge| {
+                    (edge.target() != truthy
+                        && matches!(edge.weight(), EdgeType::Normal | EdgeType::Jump))
+                    .then_some(edge.target())
+                })
+            else {
+                continue;
+            };
+            Self::redirect_short_circuit(ctx, graph, test, truthy, falsy, &mut redirects);
+        }
+        if redirects.is_empty() {
+            return Cow::Borrowed(graph);
+        }
+        let mut graph = graph.clone();
+        for (source, previous_target, target) in redirects {
+            if let Some(edge) = graph.find_edge(source, previous_target) {
+                graph.remove_edge(edge);
+                graph.add_edge(source, target, EdgeType::Normal);
+            }
+        }
+        Cow::Owned(graph)
+    }
+
+    fn redirect_short_circuit(
+        ctx: &LintContext,
+        graph: &Graph,
+        expression: &Expression,
+        truthy: BlockNodeId,
+        falsy: BlockNodeId,
+        redirects: &mut Vec<(BlockNodeId, BlockNodeId, BlockNodeId)>,
+    ) {
+        let Expression::LogicalExpression(logical) = expression.without_parentheses() else {
+            return;
+        };
+        let target = match logical.operator {
+            LogicalOperator::And => falsy,
+            LogicalOperator::Or => truthy,
+            LogicalOperator::Coalesce => return,
+        };
+        let right_start = ctx.nodes().cfg_id(logical.right.node_id());
+        let Some(left_end) = graph
+            .edges_directed(right_start, Direction::Incoming)
+            .find(|edge| matches!(edge.weight(), EdgeType::Normal))
+            .map(|edge| edge.source())
+        else {
+            return;
+        };
+        let Some(join) = graph.edges_directed(left_end, Direction::Outgoing).find_map(|edge| {
+            (edge.target() != right_start && matches!(edge.weight(), EdgeType::Normal))
+                .then_some(edge.target())
+        }) else {
+            return;
+        };
+        redirects.push((left_end, join, target));
+        let (left_truthy, left_falsy) = if logical.operator == LogicalOperator::And {
+            (right_start, falsy)
+        } else {
+            (truthy, right_start)
+        };
+        Self::redirect_short_circuit(ctx, graph, &logical.left, left_truthy, left_falsy, redirects);
+        Self::redirect_short_circuit(ctx, graph, &logical.right, truthy, falsy, redirects);
+    }
+
     fn block_id_for_node(ctx: &LintContext, graph: &Graph, node_id: NodeId) -> BasicBlockId {
         *graph.node_weight(ctx.nodes().cfg_id(node_id)).expect("expected a valid node id in graph")
     }
@@ -1553,6 +1700,23 @@ function useResource(unsafe: (resource: { readonly release: () => void }) => voi
         "function f(p, q = (p = 1), r = (p = 2)) { return p; }",
         "function f(p, { [p = 1]: q } = (p = 2, {})) { return p; }",
         "function f(p, { a = (p = 1) } = (p = 2, {})) { return p; }",
+        "let ID = 0; export class A { id = ++ID; }",
+        "let ID = 0; export class A { static id = ++ID; }",
+        "let ID = 0; export class A { constructor() { this.id = ++ID; } }",
+        "let ID = 0; export class A { id = ID; } ID = 1;",
+        "let ID = 0; export class A { static id = ID; } ID = 1;",
+        "function g(s, re) { let m = null; while (s && (m = re.exec(s))) { s = m[1]; } return m; }",
+        "function g(s, re) { let m = null; while (s || (m = re.exec(s))) { s = m[1]; } }",
+        "function g(s, re) { let m = null; while (s && (m = re.exec(m))) { s = m[1]; } }",
+        "function g(s, re) { let m = null; while ((s && (m = re.exec(s))) || fallback) { s = m[1]; } }",
+        "function g(s, re) { let m = null; while (s && (m = re.exec(s))) { s = m[1]; } use(m); }",
+        "function g(s, re) { let m = null; do { s = m; } while (s && (m = re.exec(s))); }",
+        "function g(s, re) { let m = null; while (s ?? (m = re.exec(s))) { s = m[1]; } }",
+        "function g(s, re) { let m = null; while (!(s || !(m = re.exec(s)))) { s = m[1]; } }",
+        "let x = 0; export class A { id = ([x, x] = [1, 2]); }",
+        "let x = 0; export class A { id = ([x] = [x + 1]); }",
+        "let x = 0; export class A { field = class B { [x++] = 0; }; }",
+        "export class A { field = (() => { let x = 0; return class B { field = x++; }; })(); }",
     ];
 
     let fail = vec![
@@ -1915,6 +2079,21 @@ function useResource(unsafe: (resource: { readonly release: () => void }) => voi
         "function f(p) { use(p); p = 1; }",
         "function f(p, q = p) { p = 1; return q; }",
         "function f(cb = p => { p = 1; p = 2; return p; }) { return cb; }",
+        "export function g(s, re) { let m = null; while (s && (m = re.exec(s))) { s = m[1]; } return s; }",
+        "function g(s, re) { let m = null; while (s && more && (m = re.exec(s))) { s = m[1]; } }",
+        "function g(s, re) { let m = null; while ((s && (m = re.exec(s))) && more) { s = m[1]; } }",
+        "function g(s, re) { let m = null; for (; s && (m = re.exec(s));) { s = m[1]; } }",
+        "function g(s, re) { let m = null; if (s && (m = re.exec(s))) { use(m); } }",
+        "function g(s, re) { let m = null; if (s || (m = re.exec(s))) {} else { use(m); } }",
+        "function g(s, re) { let m = null; s && (m = re.exec(s)) ? use(m) : other(); }",
+        "let ID = 0; export class A { [++ID] = 1; }",
+        "export class A { id = (() => { let x = 0; x = 1; return x; })(); }",
+        "export class A { static id = (() => { let x = 0; x = 1; return x; })(); }",
+        "function g(s, re) { let m = null; do { if (s && (m = re.exec(s))) use(m); } while (s); }",
+        "function g(queue, paused) { let fn = undefined; while (!paused && (fn = queue.shift())) { fn(); } }",
+        "function g(s, re) { let m = null; while ((s ? foo : bar) && (m = re.exec(s))) { s = m[1]; } }",
+        "function g(s, re) { let m = null; while (s && ((m = re.exec(s)), more)) { s = m[1]; } }",
+        "export class A { field = (() => { let x = 0; return class B { [x++] = 0; }; })(); }",
     ];
 
     Tester::new(NoUselessAssignment::NAME, NoUselessAssignment::PLUGIN, pass, fail)
