@@ -1,8 +1,8 @@
-use rustc_hash::FxHashMap;
-
 use oxc_ast::{
     AstKind,
-    ast::{Argument, Expression, MemberExpression, RegExpFlags},
+    ast::{
+        Argument, CallExpression, Expression, MemberExpression, RegExpFlags, VariableDeclarator,
+    },
 };
 use oxc_codegen::CodegenOptions;
 use oxc_diagnostics::OxcDiagnostic;
@@ -69,24 +69,27 @@ declare_oxc_lint!(
 );
 
 impl Rule for PreferStringReplaceAll {
-    fn run_once(&self, ctx: &LintContext) {
-        let mut resolved_patterns = FxHashMap::default();
-        for node in ctx.nodes().iter() {
-            Self::check(node, ctx, &mut resolved_patterns);
+    fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
+        match node.kind() {
+            AstKind::CallExpression(call) => Self::check_call(call, ctx, false),
+            AstKind::VariableDeclarator(declarator) => {
+                if let Some(init) = &declarator.init
+                    && is_reg_exp_with_global_flag(init, ctx)
+                {
+                    Self::check_variable(declarator, ctx);
+                }
+            }
+            _ => {}
         }
     }
 }
 
 impl PreferStringReplaceAll {
-    fn check<'a>(
-        node: &AstNode<'a>,
+    fn check_call<'a>(
+        call_expr: &CallExpression<'a>,
         ctx: &LintContext<'a>,
-        resolved_patterns: &mut FxHashMap<SymbolId, bool>,
+        resolved_pattern: bool,
     ) {
-        let AstKind::CallExpression(call_expr) = node.kind() else {
-            return;
-        };
-
         let Some(member_expr) = call_expr.callee.get_member_expr() else {
             return;
         };
@@ -115,7 +118,12 @@ impl PreferStringReplaceAll {
                     });
                 }
             }
-            "replace" if is_reg_exp_with_global_flag(pattern, ctx, resolved_patterns) => {
+            "replace"
+                if resolved_pattern
+                    || pattern
+                        .as_expression()
+                        .is_some_and(|expr| is_reg_exp_with_global_flag(expr, ctx)) =>
+            {
                 let diagnostic = use_replace_all(static_member_expr.property.span);
 
                 if let Some(k) = get_pattern_replacement(pattern) {
@@ -137,6 +145,40 @@ impl PreferStringReplaceAll {
             _ => {}
         }
     }
+
+    fn check_variable<'a>(declarator: &VariableDeclarator<'a>, ctx: &LintContext<'a>) {
+        let Some(identifier) = declarator.id.get_binding_identifier() else {
+            return;
+        };
+        let mut pending: smallvec::SmallVec<[SymbolId; 4]> =
+            smallvec::smallvec![identifier.symbol_id()];
+        while let Some(symbol_id) = pending.pop() {
+            if binding_has_writes(symbol_id, ctx) {
+                continue;
+            }
+            for reference in ctx.scoping().get_resolved_references(symbol_id) {
+                let reference_span = ctx.nodes().get_node(reference.node_id()).span();
+                match iter_outer_expressions(ctx.nodes(), reference.node_id()).next() {
+                    Some(AstKind::CallExpression(call)) => {
+                        if call.arguments.first().and_then(Argument::as_expression).is_some_and(
+                            |pattern| pattern.get_inner_expression().span() == reference_span,
+                        ) {
+                            Self::check_call(call, ctx, true);
+                        }
+                    }
+                    Some(AstKind::VariableDeclarator(alias)) => {
+                        if alias.init.as_ref().is_some_and(|init| {
+                            init.get_inner_expression().span() == reference_span
+                        }) && let Some(identifier) = alias.id.get_binding_identifier()
+                        {
+                            pending.push(identifier.symbol_id());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 fn generate_string_literal(fixer: RuleFixer<'_, '_>, value: &str) -> String {
@@ -146,84 +188,47 @@ fn generate_string_literal(fixer: RuleFixer<'_, '_>, value: &str) -> String {
     codegen.into_source_text()
 }
 
-fn is_reg_exp_with_global_flag<'a>(
-    expr: &'a Argument<'a>,
-    ctx: &LintContext<'a>,
-    resolved_patterns: &mut FxHashMap<SymbolId, bool>,
-) -> bool {
-    let Some(mut expr) = expr.as_expression() else {
-        return false;
-    };
-    let mut resolved_symbols = smallvec::SmallVec::<[_; 4]>::new();
-
-    let result = loop {
-        match expr.get_inner_expression() {
-            Expression::Identifier(ident) => {
-                let Some(symbol_id) = ctx.scoping().get_reference(ident.reference_id()).symbol_id()
-                else {
-                    break false;
-                };
-                if let Some(&result) = resolved_patterns.get(&symbol_id) {
-                    break result;
-                }
-                resolved_patterns.insert(symbol_id, false);
-                resolved_symbols.push(symbol_id);
-                let declaration = ctx.nodes().get_node(ctx.scoping().symbol_declaration(symbol_id));
-                let AstKind::VariableDeclarator(declarator) = declaration.kind() else {
-                    break false;
-                };
-                if !declarator.id.is_binding_identifier()
-                    || !ctx.scoping().symbol_redeclarations(symbol_id).is_empty()
-                {
-                    break false;
-                }
-                let Some(init) = &declarator.init else {
-                    break false;
-                };
-                if ctx.scoping().get_resolved_references(symbol_id).any(|reference| {
-                    let reference_span = ctx.nodes().get_node(reference.node_id()).span();
-                    reference.is_write()
-                        || iter_outer_expressions(ctx.nodes(), reference.node_id())
-                            .find(|kind| match kind {
-                                AstKind::StaticMemberExpression(member) => {
-                                    !member.object.span().contains_inclusive(reference_span)
-                                }
-                                AstKind::ComputedMemberExpression(member) => {
-                                    !member.object.span().contains_inclusive(reference_span)
-                                }
-                                AstKind::PrivateFieldExpression(member) => {
-                                    !member.object.span().contains_inclusive(reference_span)
-                                }
-                                _ => true,
-                            })
-                            .is_some_and(|kind| match kind {
-                                AstKind::AssignmentExpression(assignment) => {
-                                    assignment.left.span().contains_inclusive(reference_span)
-                                }
-                                AstKind::UpdateExpression(_) => true,
-                                _ => false,
-                            })
-                }) {
-                    break false;
-                }
-                expr = init;
-            }
-            Expression::RegExpLiteral(reg_exp_literal) => {
-                break reg_exp_literal.regex.flags.contains(RegExpFlags::G);
-            }
-            Expression::NewExpression(new_expr) => {
-                break is_regexp_callee(&new_expr.callee, ctx)
-                    && !matches!(new_expr.arguments.first(), Some(Argument::SpreadElement(_)))
-                    && extract_regex_flags(&new_expr.arguments)
-                        .is_some_and(|flags| flags.contains(RegExpFlags::G));
-            }
-            _ => break false,
+fn is_reg_exp_with_global_flag<'a>(expr: &Expression<'a>, ctx: &LintContext<'a>) -> bool {
+    match expr.get_inner_expression() {
+        Expression::RegExpLiteral(reg_exp_literal) => {
+            reg_exp_literal.regex.flags.contains(RegExpFlags::G)
         }
-    };
-    for symbol_id in resolved_symbols {
-        resolved_patterns.insert(symbol_id, result);
+        Expression::NewExpression(new_expr) => {
+            is_regexp_callee(&new_expr.callee, ctx)
+                && !matches!(new_expr.arguments.first(), Some(Argument::SpreadElement(_)))
+                && extract_regex_flags(&new_expr.arguments)
+                    .is_some_and(|flags| flags.contains(RegExpFlags::G))
+        }
+        _ => false,
     }
-    result
+}
+
+fn binding_has_writes(symbol_id: SymbolId, ctx: &LintContext<'_>) -> bool {
+    !ctx.scoping().symbol_redeclarations(symbol_id).is_empty()
+        || ctx.scoping().get_resolved_references(symbol_id).any(|reference| {
+            let reference_span = ctx.nodes().get_node(reference.node_id()).span();
+            reference.is_write()
+                || iter_outer_expressions(ctx.nodes(), reference.node_id())
+                    .find(|kind| match kind {
+                        AstKind::StaticMemberExpression(member) => {
+                            !member.object.span().contains_inclusive(reference_span)
+                        }
+                        AstKind::ComputedMemberExpression(member) => {
+                            !member.object.span().contains_inclusive(reference_span)
+                        }
+                        AstKind::PrivateFieldExpression(member) => {
+                            !member.object.span().contains_inclusive(reference_span)
+                        }
+                        _ => true,
+                    })
+                    .is_some_and(|kind| match kind {
+                        AstKind::AssignmentExpression(assignment) => {
+                            assignment.left.span().contains_inclusive(reference_span)
+                        }
+                        AstKind::UpdateExpression(_) => true,
+                        _ => false,
+                    })
+        })
 }
 
 fn get_pattern_replacement<'a>(expr: &'a Argument<'a>) -> Option<CompactStr> {
@@ -325,6 +330,9 @@ fn test() {
         r"const RE = /a/g; RE.lastIndex++; foo.replace(RE, bar)",
         r"const RE = /a/g; const alias = RE; RE[Symbol.replace] = undefined; foo.replace(alias, bar)",
         r#"const RE = new RegExp(...patterns, "g"); foo.replace(RE, bar)"#,
+        r"const RE = /a/g; foo.replace(unknown, RE)",
+        r"const RE = /a/g; foo.replace(...RE, bar)",
+        r"const RE = /a/g; const alias = RE.source; foo.replace(alias, bar)",
     ];
 
     let fail = vec![
@@ -385,6 +393,7 @@ export const out2 = s.replace(/a/g, "b");"#,
         r"const pattern = (/a/g); foo.replace((pattern), bar)",
         r"const pattern = /a/g; const alias = pattern; foo.replace(alias, bar)",
         r"const pattern = /a/g; obj[pattern] = value; foo.replace(pattern, bar)",
+        r"const RE = /a/g; const first = RE; const second = (first); foo.replace(first, bar); foo.replace(second, bar); foo.replace(RE, bar)",
     ];
 
     let fix = vec![
@@ -686,6 +695,10 @@ export const out2 = s.replace(/a/g, "b");"#,
         //     r#"foo.split(/a/gi).join("b")"#,
         //     r"foo.replaceAll(/a/gi, 'b')",
         // ),
+        (
+            r"const RE = /a/g; const first = RE; const second = (first); foo.replace(first, bar); foo.replace(second, bar); foo.replace(RE, bar)",
+            r"const RE = /a/g; const first = RE; const second = (first); foo.replaceAll(first, bar); foo.replaceAll(second, bar); foo.replaceAll(RE, bar)",
+        ),
     ];
 
     Tester::new(PreferStringReplaceAll::NAME, PreferStringReplaceAll::PLUGIN, pass, fail)

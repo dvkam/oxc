@@ -3919,8 +3919,9 @@ impl RuleRunner for crate::rules::unicorn::prefer_string_raw::PreferStringRaw {
 }
 
 impl RuleRunner for crate::rules::unicorn::prefer_string_replace_all::PreferStringReplaceAll {
-    const NODE_TYPES: Option<&AstTypesBitset> = None;
-    const RUN_FUNCTIONS: RuleRunFunctionsImplemented = RuleRunFunctionsImplemented::RunOnce;
+    const NODE_TYPES: Option<&AstTypesBitset> =
+        Some(&AstTypesBitset::from_types(&[AstType::CallExpression, AstType::VariableDeclarator]));
+    const RUN_FUNCTIONS: RuleRunFunctionsImplemented = RuleRunFunctionsImplemented::Run;
 }
 
 impl RuleRunner for crate::rules::unicorn::prefer_string_slice::PreferStringSlice {

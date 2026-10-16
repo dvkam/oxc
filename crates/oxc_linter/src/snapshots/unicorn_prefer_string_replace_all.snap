@@ -347,3 +347,24 @@ source: crates/oxc_linter/src/tester.rs
    ·                                                 ───────
    ╰────
   help: Replace `replace` with `replaceAll`.
+
+  ⚠ unicorn(prefer-string-replace-all): Prefer `String#replaceAll()` over `String#replace()` when using a regex with the global flag.
+   ╭─[prefer_string_replace_all.tsx:1:115]
+ 1 │ const RE = /a/g; const first = RE; const second = (first); foo.replace(first, bar); foo.replace(second, bar); foo.replace(RE, bar)
+   ·                                                                                                                   ───────
+   ╰────
+  help: Replace `replace` with `replaceAll`.
+
+  ⚠ unicorn(prefer-string-replace-all): Prefer `String#replaceAll()` over `String#replace()` when using a regex with the global flag.
+   ╭─[prefer_string_replace_all.tsx:1:64]
+ 1 │ const RE = /a/g; const first = RE; const second = (first); foo.replace(first, bar); foo.replace(second, bar); foo.replace(RE, bar)
+   ·                                                                ───────
+   ╰────
+  help: Replace `replace` with `replaceAll`.
+
+  ⚠ unicorn(prefer-string-replace-all): Prefer `String#replaceAll()` over `String#replace()` when using a regex with the global flag.
+   ╭─[prefer_string_replace_all.tsx:1:89]
+ 1 │ const RE = /a/g; const first = RE; const second = (first); foo.replace(first, bar); foo.replace(second, bar); foo.replace(RE, bar)
+   ·                                                                                         ───────
+   ╰────
+  help: Replace `replace` with `replaceAll`.
